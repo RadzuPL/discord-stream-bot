@@ -284,6 +284,8 @@ class StreamBot(discord.Client):
 def main() -> None:
     cfg = load_config()
     level = getattr(logging, cfg.log_level, logging.INFO)
+    # Configure logging first, otherwise the startup lines below would be dropped.
+    discord.utils.setup_logging(level=level, root=True)
 
     try:
         davey_version = importlib.metadata.version("davey")
@@ -299,7 +301,7 @@ def main() -> None:
         log.info("Idle mode disabled: the stream plays continuously")
 
     client = StreamBot(cfg)
-    client.run(cfg.token, log_level=level, root_logger=True)
+    client.run(cfg.token, log_handler=None)  # logging is already configured above
 
 
 if __name__ == "__main__":
