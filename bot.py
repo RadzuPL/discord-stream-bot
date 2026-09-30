@@ -24,6 +24,7 @@ log = logging.getLogger("streambot")
 TICK_SECONDS = 5          # how often the supervisor re-checks everything (events wake it earlier)
 QUICK_FAIL_SECONDS = 10   # a stream that dies sooner than this counts as a failed start
 MAX_BACKOFF = 60          # cap for retry delays, seconds
+REJOIN_DELAY = 5          # pause before rejoining voice after a lost connection (see _rejoin_cooldown)
 
 DEFAULT_FFMPEG_BEFORE = (
     "-nostdin -reconnect 1 -reconnect_streamed 1 -reconnect_on_network_error 1 "
@@ -97,6 +98,8 @@ class StreamBot(discord.Client):
         self._fail_streak = 0
         self._alone_since: float | None = None
         self._expect_stop = False
+        self._had_voice = False
+        self._left_voice_at: float | None = None
 
     async def setup_hook(self) -> None:
         self._supervisor_task = asyncio.create_task(self._supervise(), name="stream-supervisor")
@@ -151,7 +154,12 @@ class StreamBot(discord.Client):
         if vc is not None and not vc.is_connected():
             log.warning("Stale voice client, discarding it")
             await vc.disconnect(force=True)
+            self._left_voice_at = time.monotonic()
             vc = None
+
+        if vc is None:
+            await self._rejoin_cooldown()
+            vc = channel.guild.voice_client  # the library may have reconnected meanwhile
 
         if vc is None:
             log.info("Joining #%s in %s", channel.name, channel.guild.name)
@@ -159,6 +167,10 @@ class StreamBot(discord.Client):
         elif vc.channel.id != channel.id:
             log.info("Bot was moved out of the target channel, returning")
             await vc.move_to(channel)
+
+        if vc.is_connected():
+            self._had_voice = True
+            self._left_voice_at = None
 
         listeners = self._count_listeners(channel)
         if self._should_stream(listeners, playing=vc.is_playing()):
@@ -171,6 +183,26 @@ class StreamBot(discord.Client):
         # Healthy = connected and either playing or idle on purpose (nobody to play for).
         if vc.is_connected() and (idle or vc.is_playing()):
             self._touch_health()
+
+    async def _rejoin_cooldown(self) -> None:
+        """Wait a few seconds before rejoining voice after a lost connection.
+
+        When a voice session ends, Discord confirms it with a "left voice" event. If a new
+        session is already starting by then (the supervisor is woken by that very event and
+        would rejoin within the same second), discord.py attributes the stale event to the new
+        session, treats it as a forced disconnect, waits 30 s for a reconnect, gives up and
+        drops the new session too - and the cycle repeats forever. A short pause lets the old
+        confirmation arrive and be discarded first.
+        """
+        now = time.monotonic()
+        if self._left_voice_at is None:
+            if not self._had_voice:
+                return  # very first join: nothing to wait for
+            self._left_voice_at = now  # first time we notice the drop
+        remaining = REJOIN_DELAY - (now - self._left_voice_at)
+        if remaining > 0:
+            log.info("Voice connection lost, rejoining in %.0fs", remaining)
+            await asyncio.sleep(remaining)
 
     async def _resolve_channel(self) -> discord.VoiceChannel:
         channel = self.get_channel(self.cfg.channel_id) or await self.fetch_channel(self.cfg.channel_id)
@@ -273,6 +305,7 @@ class StreamBot(discord.Client):
                 await vc.disconnect(force=True)
             except Exception as exc:  # noqa: BLE001
                 log.debug("Voice disconnect failed: %s", exc)
+            self._left_voice_at = time.monotonic()
 
     def _touch_health(self) -> None:
         try:
