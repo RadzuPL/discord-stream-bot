@@ -8,7 +8,7 @@
   <Privileged>false</Privileged>
   <Support>https://github.com/RadzuPL/discord-stream-bot/issues</Support>
   <Project>https://github.com/RadzuPL/discord-stream-bot</Project>
-  <Overview>Joins one Discord voice channel and plays an audio stream (e.g. an Icecast radio stream) there, 24/7. Configured only through environment variables. No ports, no commands, no privileged intents.</Overview>
+  <Overview>Joins one Discord voice channel and plays an audio stream (e.g. an Icecast radio stream) there, but only while somebody is listening. Configured only through environment variables. No ports, no commands, no privileged intents.</Overview>
   <Category>MediaServer:Music Tools:</Category>
   <WebUI></WebUI>
   <TemplateURL>https://raw.githubusercontent.com/RadzuPL/discord-stream-bot/main/unraid/discord-stream-bot.xml</TemplateURL>
@@ -18,6 +18,7 @@
   <Config Name="Discord bot token" Target="DISCORD_TOKEN" Default="" Mode="" Description="Bot token from the Discord Developer Portal (Bot page)." Type="Variable" Display="always" Required="true" Mask="true"></Config>
   <Config Name="Voice channel ID" Target="VOICE_CHANNEL_ID" Default="" Mode="" Description="ID of the voice channel the bot joins (Developer Mode - right click channel - Copy Channel ID)." Type="Variable" Display="always" Required="true" Mask="false"></Config>
   <Config Name="Stream URL" Target="STREAM_URL" Default="" Mode="" Description="URL of the audio stream to play, e.g. http://deadair:80/live.mp3" Type="Variable" Display="always" Required="true" Mask="false"></Config>
+  <Config Name="Idle timeout (s)" Target="IDLE_TIMEOUT" Default="60" Mode="" Description="Seconds without listeners in the channel before the stream stops (the bot stays in the channel, silent). 0 = always play." Type="Variable" Display="advanced" Required="false" Mask="false">60</Config>
   <Config Name="Volume" Target="VOLUME" Default="1.0" Mode="" Description="Playback volume multiplier (1.0 = unchanged)." Type="Variable" Display="advanced" Required="false" Mask="false">1.0</Config>
   <Config Name="Log level" Target="LOG_LEVEL" Default="INFO" Mode="" Description="DEBUG, INFO, WARNING or ERROR." Type="Variable" Display="advanced" Required="false" Mask="false">INFO</Config>
 </Container>

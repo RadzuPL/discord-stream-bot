@@ -1,8 +1,9 @@
 """discord-stream-bot
 
 Joins one Discord voice channel and plays an audio stream (e.g. an Icecast/MP3
-radio stream) there, 24/7. Configuration is done purely through environment
-variables. The bot registers no commands and needs no privileged intents.
+radio stream) there, but only while somebody is actually listening. Configuration
+is done purely through environment variables. The bot registers no commands and
+needs no privileged intents.
 """
 from __future__ import annotations
 
@@ -20,7 +21,7 @@ import discord
 
 log = logging.getLogger("streambot")
 
-TICK_SECONDS = 5          # how often the supervisor checks the connection
+TICK_SECONDS = 5          # how often the supervisor re-checks everything (events wake it earlier)
 QUICK_FAIL_SECONDS = 10   # a stream that dies sooner than this counts as a failed start
 MAX_BACKOFF = 60          # cap for retry delays, seconds
 
@@ -36,6 +37,7 @@ class Config:
     channel_id: int
     stream_url: str
     volume: float
+    idle_timeout: int
     log_level: str
     health_file: Path
     ffmpeg_before: str
@@ -58,12 +60,17 @@ def load_config() -> Config:
         volume = float(os.getenv("VOLUME", "1.0"))
     except ValueError:
         sys.exit("VOLUME must be a number, e.g. 1.0 or 0.5.")
+    try:
+        idle_timeout = int(os.getenv("IDLE_TIMEOUT", "60"))
+    except ValueError:
+        sys.exit("IDLE_TIMEOUT must be a whole number of seconds (0 = always play).")
 
     return Config(
         token=token,
         channel_id=channel_id,
         stream_url=stream_url,
         volume=volume,
+        idle_timeout=idle_timeout,
         log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
         health_file=Path(os.getenv("HEALTH_FILE", "/tmp/streambot.healthy")),
         ffmpeg_before=os.getenv("FFMPEG_BEFORE_OPTIONS", DEFAULT_FFMPEG_BEFORE),
@@ -85,14 +92,24 @@ class StreamBot(discord.Client):
         super().__init__(intents=discord.Intents.default())
         self.cfg = cfg
         self._supervisor_task: asyncio.Task | None = None
+        self._wake = asyncio.Event()
         self._play_started = 0.0
         self._fail_streak = 0
+        self._alone_since: float | None = None
+        self._expect_stop = False
 
     async def setup_hook(self) -> None:
         self._supervisor_task = asyncio.create_task(self._supervise(), name="stream-supervisor")
 
     async def on_ready(self) -> None:
         log.info("Logged in as %s", self.user)
+
+    async def on_voice_state_update(self, member, before, after) -> None:
+        # Somebody joined/left/(un)deafened in the target channel: re-check right away
+        # instead of waiting for the next periodic tick.
+        target = self.cfg.channel_id
+        if (before.channel and before.channel.id == target) or (after.channel and after.channel.id == target):
+            self._wake.set()
 
     async def close(self) -> None:
         if self._supervisor_task is not None:
@@ -109,7 +126,11 @@ class StreamBot(discord.Client):
             try:
                 await self._tick()
                 error_streak = 0
-                await asyncio.sleep(TICK_SECONDS)
+                try:
+                    await asyncio.wait_for(self._wake.wait(), timeout=TICK_SECONDS)
+                except asyncio.TimeoutError:
+                    pass
+                self._wake.clear()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - supervisor must never die
@@ -139,9 +160,16 @@ class StreamBot(discord.Client):
             log.info("Bot was moved out of the target channel, returning")
             await vc.move_to(channel)
 
-        await self._ensure_stream(vc)
+        listeners = self._count_listeners(channel)
+        if self._should_stream(listeners, playing=vc.is_playing()):
+            await self._ensure_stream(vc)
+            idle = False
+        else:
+            self._stop_stream(vc)
+            idle = True
 
-        if vc.is_connected() and vc.is_playing():
+        # Healthy = connected and either playing or idle on purpose (nobody to play for).
+        if vc.is_connected() and (idle or vc.is_playing()):
             self._touch_health()
 
     async def _resolve_channel(self) -> discord.VoiceChannel:
@@ -152,6 +180,38 @@ class StreamBot(discord.Client):
                 "(stage channels are not supported)"
             )
         return channel
+
+    # ---- listeners --------------------------------------------------------
+
+    def _count_listeners(self, channel: discord.VoiceChannel) -> int:
+        """People in the channel who can actually hear the stream (not us, not other bots, not deafened)."""
+        count = 0
+        for user_id, state in channel.voice_states.items():
+            if user_id == self.user.id:
+                continue
+            if state.deaf or state.self_deaf:
+                continue
+            member = channel.guild.get_member(user_id)
+            if member is not None and member.bot:
+                continue
+            count += 1
+        return count
+
+    def _should_stream(self, listeners: int, playing: bool) -> bool:
+        if self.cfg.idle_timeout <= 0 or listeners > 0:
+            if self._alone_since is not None:
+                log.info("Listener present again")
+            self._alone_since = None
+            return True
+
+        now = time.monotonic()
+        if self._alone_since is None:
+            self._alone_since = now
+            if playing:
+                log.info("Channel is empty, stopping the stream in %ds unless somebody joins", self.cfg.idle_timeout)
+        # The grace period only keeps an already running stream alive;
+        # an empty channel never starts a new one.
+        return playing and (now - self._alone_since) < self.cfg.idle_timeout
 
     # ---- playback ---------------------------------------------------------
 
@@ -177,6 +237,14 @@ class StreamBot(discord.Client):
         vc.play(self._make_source(), after=self._on_playback_end)
         self._play_started = time.monotonic()
 
+    def _stop_stream(self, vc: discord.VoiceClient) -> None:
+        if vc.is_playing() or vc.is_paused():
+            log.info("Nobody has been listening for %ds, stopping the stream", self.cfg.idle_timeout)
+            self._expect_stop = True
+            vc.stop()
+        self._play_started = 0.0
+        self._fail_streak = 0
+
     def _make_source(self) -> discord.AudioSource:
         source: discord.AudioSource = discord.FFmpegPCMAudio(
             self.cfg.stream_url,
@@ -189,6 +257,9 @@ class StreamBot(discord.Client):
 
     def _on_playback_end(self, error: Exception | None) -> None:
         # Runs in the player thread; the supervisor restarts playback on its next tick.
+        if self._expect_stop:
+            self._expect_stop = False
+            return
         if error:
             log.error("Playback stopped with error: %s", error)
         else:
@@ -222,6 +293,10 @@ def main() -> None:
     if davey_version is None:
         # Since 2026-03-01 Discord voice requires DAVE (E2EE); without davey voice will not work.
         print("WARNING: 'davey' is not installed - Discord voice requires DAVE support.", file=sys.stderr)
+    if cfg.idle_timeout > 0:
+        log.info("Idle mode: the stream stops %ds after the last listener leaves", cfg.idle_timeout)
+    else:
+        log.info("Idle mode disabled: the stream plays continuously")
 
     client = StreamBot(cfg)
     client.run(cfg.token, log_level=level, root_logger=True)
