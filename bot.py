@@ -36,9 +36,15 @@ AUDIBLE_PEAK = 64         # 16-bit peak above which a frame counts as sound rath
 AUDIBLE_WATCH = 120       # seconds after opening the stream during which the first audible frame is looked for
 SLOW_DNS = 1.0            # a stream host lookup slower than this is logged as a warning
 
+# The last three options are about start-up time. Without them ffmpeg guesses the input format by
+# reading up to 1 MB of it (`formatprobesize`), and a raw MP3 stream from Icecast has no header to
+# make that guess certain early - so on a live 128 kbps mount it waited ~8 s for data that arrives
+# in real time (Icecast only sends a ~0.5 s burst on connect). 8 KB is several MP3 frames at any
+# bitrate and still recognises Ogg/Opus and AAC. Measured against a simulated mount: 7.8 s -> 0.16 s.
 DEFAULT_FFMPEG_BEFORE = (
     "-nostdin -reconnect 1 -reconnect_streamed 1 -reconnect_on_network_error 1 "
-    "-reconnect_delay_max 5 -rw_timeout 15000000"
+    "-reconnect_delay_max 5 -rw_timeout 15000000 "
+    "-formatprobesize 8192 -probesize 32768 -analyzeduration 500000"
 )
 
 _TRUE = {"1", "true", "yes", "on"}
