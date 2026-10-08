@@ -24,12 +24,15 @@ log = logging.getLogger("streambot")
 TICK_SECONDS = 5          # how often the supervisor re-checks everything (events wake it earlier)
 QUICK_FAIL_SECONDS = 10   # a stream that dies sooner than this counts as a failed start
 MAX_BACKOFF = 60          # cap for retry delays, seconds
-REJOIN_DELAY = 5          # pause before rejoining voice after a lost connection (see _rejoin_cooldown)
+REJOIN_DELAY = 5          # pause before rejoining voice after leaving it (see _rejoin_cooldown)
 
 DEFAULT_FFMPEG_BEFORE = (
     "-nostdin -reconnect 1 -reconnect_streamed 1 -reconnect_on_network_error 1 "
     "-reconnect_delay_max 5 -rw_timeout 15000000"
 )
+
+_TRUE = {"1", "true", "yes", "on"}
+_FALSE = {"0", "false", "no", "off"}
 
 
 @dataclass(frozen=True)
@@ -39,9 +42,21 @@ class Config:
     stream_url: str
     volume: float
     idle_timeout: int
+    leave_when_empty: bool
     log_level: str
     health_file: Path
     ffmpeg_before: str
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name, "").strip().lower()
+    if not raw:
+        return default
+    if raw in _TRUE:
+        return True
+    if raw in _FALSE:
+        return False
+    sys.exit(f"{name} must be true or false (also accepted: 1/0, yes/no, on/off).")
 
 
 def load_config() -> Config:
@@ -72,6 +87,7 @@ def load_config() -> Config:
         stream_url=stream_url,
         volume=volume,
         idle_timeout=idle_timeout,
+        leave_when_empty=_env_bool("LEAVE_WHEN_EMPTY", True),
         log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
         health_file=Path(os.getenv("HEALTH_FILE", "/tmp/streambot.healthy")),
         ffmpeg_before=os.getenv("FFMPEG_BEFORE_OPTIONS", DEFAULT_FFMPEG_BEFORE),
@@ -89,7 +105,9 @@ def _safe_url(url: str) -> str:
 
 class StreamBot(discord.Client):
     def __init__(self, cfg: Config) -> None:
-        # Default intents only: no privileged intents needed for voice.
+        # Default intents only: no privileged intents needed for voice. The default set
+        # includes voice_states, so the bot sees who is in the channel even when it is
+        # not connected there itself (needed for LEAVE_WHEN_EMPTY).
         super().__init__(intents=discord.Intents.default())
         self.cfg = cfg
         self._supervisor_task: asyncio.Task | None = None
@@ -157,6 +175,20 @@ class StreamBot(discord.Client):
             self._left_voice_at = time.monotonic()
             vc = None
 
+        listeners = self._count_listeners(channel)
+
+        if self.cfg.leave_when_empty:
+            playing = vc is not None and vc.is_playing()
+            if not self._should_stream(listeners, playing=playing):
+                # Nobody to play for (and the grace period is over): leave the channel so
+                # the server icon stops showing an ongoing voice call.
+                if vc is not None:
+                    self._stop_stream(vc)
+                    log.info("Leaving #%s, nobody is listening", channel.name)
+                    await self._drop_voice()
+                self._touch_health()  # out of the channel on purpose = healthy
+                return
+
         if vc is None:
             await self._rejoin_cooldown()
             vc = channel.guild.voice_client  # the library may have reconnected meanwhile
@@ -172,7 +204,6 @@ class StreamBot(discord.Client):
             self._had_voice = True
             self._left_voice_at = None
 
-        listeners = self._count_listeners(channel)
         if self._should_stream(listeners, playing=vc.is_playing()):
             await self._ensure_stream(vc)
             idle = False
@@ -185,7 +216,7 @@ class StreamBot(discord.Client):
             self._touch_health()
 
     async def _rejoin_cooldown(self) -> None:
-        """Wait a few seconds before rejoining voice after a lost connection.
+        """Wait a few seconds before rejoining voice after leaving it (on purpose or not).
 
         When a voice session ends, Discord confirms it with a "left voice" event. If a new
         session is already starting by then (the supervisor is woken by that very event and
@@ -201,7 +232,7 @@ class StreamBot(discord.Client):
             self._left_voice_at = now  # first time we notice the drop
         remaining = REJOIN_DELAY - (now - self._left_voice_at)
         if remaining > 0:
-            log.info("Voice connection lost, rejoining in %.0fs", remaining)
+            log.info("Rejoining voice in %.0fs", remaining)
             await asyncio.sleep(remaining)
 
     async def _resolve_channel(self) -> discord.VoiceChannel:
@@ -240,7 +271,8 @@ class StreamBot(discord.Client):
         if self._alone_since is None:
             self._alone_since = now
             if playing:
-                log.info("Channel is empty, stopping the stream in %ds unless somebody joins", self.cfg.idle_timeout)
+                action = "leaving the channel" if self.cfg.leave_when_empty else "stopping the stream"
+                log.info("Channel is empty, %s in %ds unless somebody joins", action, self.cfg.idle_timeout)
         # The grace period only keeps an already running stream alive;
         # an empty channel never starts a new one.
         return playing and (now - self._alone_since) < self.cfg.idle_timeout
@@ -329,9 +361,13 @@ def main() -> None:
         # Since 2026-03-01 Discord voice requires DAVE (E2EE); without davey voice will not work.
         print("WARNING: 'davey' is not installed - Discord voice requires DAVE support.", file=sys.stderr)
     if cfg.idle_timeout > 0:
-        log.info("Idle mode: the stream stops %ds after the last listener leaves", cfg.idle_timeout)
+        where = "leaves the channel" if cfg.leave_when_empty else "stays in the channel, silent"
+        log.info(
+            "Idle mode: %ds after the last listener leaves, the stream stops and the bot %s",
+            cfg.idle_timeout, where,
+        )
     else:
-        log.info("Idle mode disabled: the stream plays continuously")
+        log.info("Idle mode disabled: the stream plays continuously and the bot never leaves")
 
     client = StreamBot(cfg)
     client.run(cfg.token, log_handler=None)  # logging is already configured above
