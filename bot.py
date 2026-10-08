@@ -9,13 +9,19 @@ from __future__ import annotations
 
 import asyncio
 import importlib.metadata
+import ipaddress
 import logging
 import os
+import queue
+import shlex
+import socket
 import sys
+import threading
 import time
+from array import array
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 import discord
 
@@ -25,6 +31,10 @@ TICK_SECONDS = 5          # how often the supervisor re-checks everything (event
 QUICK_FAIL_SECONDS = 10   # a stream that dies sooner than this counts as a failed start
 MAX_BACKOFF = 60          # cap for retry delays, seconds
 REJOIN_DELAY = 5          # pause before rejoining voice after leaving it (see _rejoin_cooldown)
+PREFETCH_FRAMES = 250     # 20 ms frames read ahead of the player (5 s): room to buffer during the voice handshake
+AUDIBLE_PEAK = 64         # 16-bit peak above which a frame counts as sound rather than silence (about -54 dBFS)
+AUDIBLE_WATCH = 120       # seconds after opening the stream during which the first audible frame is looked for
+SLOW_DNS = 1.0            # a stream host lookup slower than this is logged as a warning
 
 DEFAULT_FFMPEG_BEFORE = (
     "-nostdin -reconnect 1 -reconnect_streamed 1 -reconnect_on_network_error 1 "
@@ -43,6 +53,7 @@ class Config:
     volume: float
     idle_timeout: int
     leave_when_empty: bool
+    stream_ipv4: bool
     log_level: str
     health_file: Path
     ffmpeg_before: str
@@ -88,6 +99,7 @@ def load_config() -> Config:
         volume=volume,
         idle_timeout=idle_timeout,
         leave_when_empty=_env_bool("LEAVE_WHEN_EMPTY", True),
+        stream_ipv4=_env_bool("STREAM_IPV4", True),
         log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
         health_file=Path(os.getenv("HEALTH_FILE", "/tmp/streambot.healthy")),
         ffmpeg_before=os.getenv("FFMPEG_BEFORE_OPTIONS", DEFAULT_FFMPEG_BEFORE),
@@ -101,6 +113,101 @@ def _safe_url(url: str) -> str:
         return "<stream>"
     port = f":{parts.port}" if parts.port else ""
     return f"{parts.scheme}://{parts.hostname}{port}{parts.path}"
+
+
+def _ipv4_target(url: str) -> tuple[str, str | None]:
+    """Resolve a plain-http stream host to an IPv4 address up front.
+
+    Returns the URL to hand ffmpeg and the Host header to send with it (None = use the URL as is).
+    ffmpeg resolves the host itself with an IPv4+IPv6 lookup, and inside a container the IPv6
+    half of that lookup for a Docker container name can wait for a DNS timeout (Docker's embedded
+    resolver passes it upstream), which delays every stream start by seconds. Asking for IPv4 only
+    is answered by Docker's resolver at once. HTTPS is left alone: rewriting it to an IP would break
+    certificate checks.
+    """
+    parts = urlsplit(url)
+    host = parts.hostname
+    if parts.scheme != "http" or not host:
+        return url, None
+    try:
+        ipaddress.ip_address(host)
+        return url, None  # already an address
+    except ValueError:
+        pass
+    infos = socket.getaddrinfo(host, parts.port or 80, socket.AF_INET, socket.SOCK_STREAM)
+    ip = infos[0][4][0]
+    netloc = ip + (f":{parts.port}" if parts.port else "")
+    if "@" in parts.netloc:
+        netloc = parts.netloc.rsplit("@", 1)[0] + "@" + netloc
+    host_header = host + (f":{parts.port}" if parts.port else "")
+    return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment)), host_header
+
+
+def _is_audible(frame: bytes) -> bool:
+    samples = array("h")
+    samples.frombytes(frame[: len(frame) - len(frame) % 2])
+    return bool(samples) and (max(samples) > AUDIBLE_PEAK or min(samples) < -AUDIBLE_PEAK)
+
+
+class _PrefetchedSource(discord.AudioSource):
+    """Reads the stream on its own thread from the moment ffmpeg starts.
+
+    Two jobs: the stream connects and buffers while the voice connection is still being set up
+    (instead of only after it), and the log gets real timings - when the first audio arrived from
+    the stream and when it first stopped being silence (an audience-gated station sends silence
+    until it is back on air).
+    """
+
+    def __init__(self, inner: discord.AudioSource, opened_at: float) -> None:
+        self._inner = inner
+        self._opened_at = opened_at
+        self._frames: queue.Queue[bytes] = queue.Queue(maxsize=PREFETCH_FRAMES)
+        self._closed = threading.Event()
+        self._thread = threading.Thread(target=self._pump, name="stream-prefetch", daemon=True)
+        self._thread.start()
+
+    def _pump(self) -> None:
+        got_audio = heard = False
+        try:
+            while not self._closed.is_set():
+                frame = self._inner.read()
+                if not frame:
+                    break
+                elapsed = time.monotonic() - self._opened_at
+                if not got_audio:
+                    got_audio = True
+                    log.info("Stream is delivering audio %.1fs after opening it", elapsed)
+                if not heard and elapsed < AUDIBLE_WATCH and _is_audible(frame):
+                    heard = True
+                    log.info("Stream became audible %.1fs after opening it", elapsed)
+                self._put(frame)
+        except Exception as exc:  # noqa: BLE001 - reader thread must end cleanly
+            log.debug("Stream reader stopped: %s", exc)
+        finally:
+            self._put(b"")  # end of stream for the player
+
+    def _put(self, frame: bytes) -> None:
+        while not self._closed.is_set():
+            try:
+                self._frames.put(frame, timeout=0.5)
+                return
+            except queue.Full:
+                continue
+
+    def read(self) -> bytes:
+        while not self._closed.is_set():
+            try:
+                return self._frames.get(timeout=0.5)
+            except queue.Empty:
+                continue
+        return b""
+
+    def is_opus(self) -> bool:
+        return False
+
+    def cleanup(self) -> None:
+        self._closed.set()
+        self._inner.cleanup()
 
 
 class StreamBot(discord.Client):
@@ -118,6 +225,7 @@ class StreamBot(discord.Client):
         self._expect_stop = False
         self._had_voice = False
         self._left_voice_at: float | None = None
+        self._pending: discord.AudioSource | None = None  # stream opened ahead of a (re)join
 
     async def setup_hook(self) -> None:
         self._supervisor_task = asyncio.create_task(self._supervise(), name="stream-supervisor")
@@ -135,6 +243,7 @@ class StreamBot(discord.Client):
     async def close(self) -> None:
         if self._supervisor_task is not None:
             self._supervisor_task.cancel()
+        self._discard_pending()
         await self._drop_voice()
         await super().close()
 
@@ -182,6 +291,7 @@ class StreamBot(discord.Client):
             if not self._should_stream(listeners, playing=playing):
                 # Nobody to play for (and the grace period is over): leave the channel so
                 # the server icon stops showing an ongoing voice call.
+                self._discard_pending()
                 if vc is not None:
                     self._stop_stream(vc)
                     log.info("Leaving #%s, nobody is listening", channel.name)
@@ -190,12 +300,20 @@ class StreamBot(discord.Client):
                 return
 
         if vc is None:
+            if self._pending is None and (listeners > 0 or self.cfg.idle_timeout <= 0):
+                # Open the stream now, so it connects and buffers during the rejoin pause and the
+                # voice handshake (several seconds with DAVE) instead of only after them.
+                self._pending = await self._open_stream()
             await self._rejoin_cooldown()
             vc = channel.guild.voice_client  # the library may have reconnected meanwhile
 
         if vc is None:
             log.info("Joining #%s in %s", channel.name, channel.guild.name)
-            vc = await channel.connect(timeout=30.0, reconnect=True, self_deaf=True)
+            try:
+                vc = await channel.connect(timeout=30.0, reconnect=True, self_deaf=True)
+            except BaseException:
+                self._discard_pending()
+                raise
         elif vc.channel.id != channel.id:
             log.info("Bot was moved out of the target channel, returning")
             await vc.move_to(channel)
@@ -204,10 +322,12 @@ class StreamBot(discord.Client):
             self._had_voice = True
             self._left_voice_at = None
 
+        listeners = self._count_listeners(channel)  # again: joining takes seconds, people come and go
         if self._should_stream(listeners, playing=vc.is_playing()):
             await self._ensure_stream(vc)
             idle = False
         else:
+            self._discard_pending()
             self._stop_stream(vc)
             idle = True
 
@@ -297,8 +417,10 @@ class StreamBot(discord.Client):
             )
             await asyncio.sleep(wait)
 
-        log.info("Starting stream from %s", _safe_url(self.cfg.stream_url))
-        vc.play(self._make_source(), after=self._on_playback_end)
+        source = self._pending or await self._open_stream()
+        self._pending = None
+        log.info("Starting playback")
+        vc.play(source, after=self._on_playback_end)
         self._play_started = time.monotonic()
 
     def _stop_stream(self, vc: discord.VoiceClient) -> None:
@@ -309,15 +431,38 @@ class StreamBot(discord.Client):
         self._play_started = 0.0
         self._fail_streak = 0
 
-    def _make_source(self) -> discord.AudioSource:
-        source: discord.AudioSource = discord.FFmpegPCMAudio(
-            self.cfg.stream_url,
-            before_options=self.cfg.ffmpeg_before,
-            options="-vn",
-        )
+    async def _stream_target(self) -> tuple[str, str | None]:
+        url = self.cfg.stream_url
+        if not self.cfg.stream_ipv4:
+            return url, None
+        started = time.monotonic()
+        try:
+            target = await asyncio.get_running_loop().run_in_executor(None, _ipv4_target, url)
+        except OSError as exc:
+            log.warning("IPv4 lookup for the stream host failed (%s); letting ffmpeg resolve it", exc)
+            return url, None
+        took = time.monotonic() - started
+        if took > SLOW_DNS:
+            log.warning("IPv4 lookup for the stream host took %.1fs", took)
+        return target
+
+    async def _open_stream(self) -> discord.AudioSource:
+        url, host_header = await self._stream_target()
+        before = self.cfg.ffmpeg_before
+        if host_header:
+            before += " -headers " + shlex.quote(f"Host: {host_header}\r\n")
+        log.info("Opening stream from %s", _safe_url(self.cfg.stream_url))
+        opened_at = time.monotonic()
+        ffmpeg = discord.FFmpegPCMAudio(url, before_options=before, options="-vn")
+        source: discord.AudioSource = _PrefetchedSource(ffmpeg, opened_at)
         if abs(self.cfg.volume - 1.0) > 1e-3:
             source = discord.PCMVolumeTransformer(source, volume=self.cfg.volume)
         return source
+
+    def _discard_pending(self) -> None:
+        if self._pending is not None:
+            self._pending.cleanup()
+            self._pending = None
 
     def _on_playback_end(self, error: Exception | None) -> None:
         # Runs in the player thread; the supervisor restarts playback on its next tick.
