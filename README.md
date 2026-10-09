@@ -109,6 +109,24 @@ When the template changes in the repo, run the `wget -O ...` command again. Upda
 - Since 1 March 2026 Discord requires end-to-end encryption (DAVE) in voice channels. It is supported by discord.py ≥ 2.7 together with the `davey` package; both are in `requirements.txt`. If the startup log says `davey MISSING`, voice will not work.
 - Stage channels are not supported, only regular voice channels.
 
+### Reconnect-loop protection
+
+If the voice connection drops abruptly (for example a network hiccup closes the voice websocket with code 1006), discord.py tries to recover the session on its own and waits up to 30 s for it. A bot that force-rejoins inside that window can end up fighting the library: every new session gets killed by the leftover timer of the previous one, and the log shows a strict 30 s cycle (join, about 20 s of audio, `Reconnect was unsuccessful, disconnecting from voice normally...`, join again). Seen live on 2026-10-09; the most likely explanation is the rejoin-versus-library race described above.
+
+The bot now guards against it. The values are constants at the top of `bot.py`, not environment variables:
+
+| Constant | Value | What it does |
+|---|---|---|
+| `STALE_GRACE` | 45 s | A disconnected voice client gets this long to be recovered by discord.py itself before the bot discards it and joins again |
+| `SHORT_SESSION` | 40 s | A voice session that ends sooner than this after connecting counts as a flap. Leaving on purpose (`LEAVE_WHEN_EMPTY`) does not count |
+| `FLAP_LIMIT` / `FLAP_WINDOW` | 4 in 150 s | This many flaps within this window trips the loop breaker |
+| `FLAP_COOLDOWN` | 45 s | The breaker drops voice and stays out for this long — longer than the library's 30 s, so its leftover timers expire |
+| `ESCALATE_TRIPS` / `ESCALATE_WINDOW` | 2 in 600 s | If the breaker trips this many times within this window, the process exits with code 1 so the container's restart policy (`unless-stopped` / `restart: unless-stopped`) starts a clean one |
+
+One side effect: after a lost voice connection the bot may wait up to 45 s for discord.py to recover it before it joins by itself.
+
+Log lines to look for: `Voice connection lost, giving the library 45s to recover it`, `Voice session ended after only Ns`, `staying out of voice for 45s`, `exiting so the container is restarted`. The last one requires a restart policy on the container; without one the bot simply stays stopped.
+
 ### Troubleshooting
 
 | Symptom | What to check |
@@ -120,6 +138,7 @@ When the template changes in the repo, run the `wget -O ...` command again. Upda
 | Bot sits in the channel and is silent | Normal with `LEAVE_WHEN_EMPTY=false` when nobody else is there (a deafened person does not count). Otherwise: the Speak permission, the `davey` line in the log, whether `STREAM_URL` is reachable from the container |
 | `Stream ended after 0s` in a loop | Wrong address or stream unavailable; set `LOG_LEVEL=DEBUG` to see ffmpeg output |
 | Music starts many seconds after the bot joins | Compare the two timing lines in the log. `delivering audio` late = connection/DNS (also look for `IPv4 lookup for the stream host took …`); `became audible` much later than `delivering` = the station was off air and is warming up |
+| Bot joins, plays about 20 s, gets thrown out and repeats every ~30 s | A voice reconnect loop (see *Reconnect-loop protection*). The loop breaker should end it on its own; `docker restart discord-stream-bot` always does |
 
 ### Development
 
@@ -236,6 +255,24 @@ Gdy szablon w repo się zmieni, powtórz `wget -O ...`. Aktualizacje samego obra
 - Discord od 1 marca 2026 wymaga szyfrowania E2EE (DAVE) na kanałach głosowych. Obsługuje je discord.py ≥ 2.7 z pakietem `davey`; oba są w `requirements.txt`. Jeśli w logu startowym widzisz `davey MISSING`, głos nie zadziała.
 - Kanały typu Stage nie są obsługiwane, tylko zwykłe kanały głosowe.
 
+### Ochrona przed pętlą reconnectu
+
+Gdy połączenie głosowe zerwie się nagle (np. chwilowy problem z siecią zamyka voice websocket kodem 1006), discord.py próbuje samo odzyskać sesję i czeka na to do 30 s. Bot, który w tym oknie wchodzi na siłę od nowa, może zacząć walczyć z biblioteką: każdą nową sesję ubija pozostały timer poprzedniej, a w logu widać sztywny cykl co 30 s (wejście, ok. 20 s audio, `Reconnect was unsuccessful, disconnecting from voice normally...`, wejście od nowa). Zaobserwowane na żywo 2026-10-09; najbardziej prawdopodobne wyjaśnienie to opisany wyżej wyścig między ponownym wejściem bota a biblioteką.
+
+Bot ma teraz zabezpieczenie. Wartości to stałe na początku `bot.py`, nie zmienne środowiskowe:
+
+| Stała | Wartość | Co robi |
+|---|---|---|
+| `STALE_GRACE` | 45 s | Rozłączony klient głosowy dostaje tyle czasu na odzyskanie przez samo discord.py, zanim bot go odrzuci i wejdzie od nowa |
+| `SHORT_SESSION` | 40 s | Sesja głosowa, która kończy się wcześniej niż tyle po połączeniu, liczy się jako flap. Celowe wyjście (`LEAVE_WHEN_EMPTY`) się nie liczy |
+| `FLAP_LIMIT` / `FLAP_WINDOW` | 4 w 150 s | Tyle flapów w takim oknie uruchamia bezpiecznik |
+| `FLAP_COOLDOWN` | 45 s | Bezpiecznik opuszcza głos i siedzi poza nim tyle czasu — dłużej niż 30 s biblioteki, więc jej pozostałe timery wygasają |
+| `ESCALATE_TRIPS` / `ESCALATE_WINDOW` | 2 w 600 s | Jeśli bezpiecznik zadziała tyle razy w takim oknie, proces kończy się kodem 1, a polityka restartu kontenera (`unless-stopped` / `restart: unless-stopped`) uruchamia czysty |
+
+Jeden skutek uboczny: po utracie połączenia głosowego bot może czekać do 45 s na odzyskanie go przez discord.py, zanim wejdzie sam.
+
+Linie w logu do szukania: `Voice connection lost, giving the library 45s to recover it`, `Voice session ended after only Ns`, `staying out of voice for 45s`, `exiting so the container is restarted`. Ostatnia wymaga polityki restartu na kontenerze; bez niej bot po prostu zostaje zatrzymany.
+
 ### Rozwiązywanie problemów
 
 | Objaw | Co sprawdzić |
@@ -247,6 +284,7 @@ Gdy szablon w repo się zmieni, powtórz `wget -O ...`. Aktualizacje samego obra
 | Bot siedzi na kanale i milczy | Przy `LEAVE_WHEN_EMPTY=false` to norma, gdy nikogo więcej nie ma (osoba z wyłączonym dźwiękiem się nie liczy). Poza tym: uprawnienie Speak, linia `davey` w logu, czy `STREAM_URL` jest osiągalny z kontenera |
 | `Stream ended after 0s` w kółko | Zły adres lub strumień niedostępny; ustaw `LOG_LEVEL=DEBUG`, żeby zobaczyć ffmpeg |
 | Muzyka rusza wiele sekund po wejściu bota | Porównaj dwie linie z czasami w logu. Późne `delivering audio` = połączenie/DNS (szukaj też `IPv4 lookup for the stream host took …`); `became audible` dużo później niż `delivering` = stacja była poza anteną i się rozgrzewa |
+| Bot wchodzi, gra ok. 20 s, jest wyrzucany i tak w kółko co ok. 30 s | Pętla reconnectu głosu (patrz *Ochrona przed pętlą reconnectu*). Bezpiecznik powinien ją przerwać sam; `docker restart discord-stream-bot` zawsze pomaga |
 
 ### Rozwój
 
