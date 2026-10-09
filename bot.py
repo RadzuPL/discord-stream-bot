@@ -19,6 +19,7 @@ import sys
 import threading
 import time
 from array import array
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
@@ -35,6 +36,18 @@ PREFETCH_FRAMES = 250     # 20 ms frames read ahead of the player (5 s): room to
 AUDIBLE_PEAK = 64         # 16-bit peak above which a frame counts as sound rather than silence (about -54 dBFS)
 AUDIBLE_WATCH = 120       # seconds after opening the stream during which the first audible frame is looked for
 SLOW_DNS = 1.0            # a stream host lookup slower than this is logged as a warning
+
+# Protection against a voice reconnect loop (see _tick and _break_flap_loop). discord.py waits up to
+# 30 s (VoiceConnectionState.timeout) for a dropped voice session to come back; a bot that joins again
+# inside that window can have every new session killed by the leftover timer of the previous one,
+# forever. Seen live on 2026-10-09 after a single websocket close (code 1006).
+STALE_GRACE = 45          # seconds a disconnected voice client is left to the library's own reconnect before it is discarded
+SHORT_SESSION = 40        # a voice session that ends sooner than this (seconds after connecting) counts as a flap
+FLAP_WINDOW = 150         # this many seconds ...
+FLAP_LIMIT = 4            # ... with this many flaps means a reconnect loop
+FLAP_COOLDOWN = 45        # stay out of voice this long to break the loop (must be longer than the library's 30 s)
+ESCALATE_WINDOW = 600     # if the loop breaker trips ESCALATE_TRIPS times within this many seconds ...
+ESCALATE_TRIPS = 2        # ... the process exits, so the container's restart policy brings it back clean
 
 # The last three options are about start-up time. Without them ffmpeg guesses the input format by
 # reading up to 1 MB of it (`formatprobesize`), and a raw MP3 stream from Icecast has no header to
@@ -223,7 +236,9 @@ class StreamBot(discord.Client):
         # not connected there itself (needed for LEAVE_WHEN_EMPTY).
         super().__init__(intents=discord.Intents.default())
         self.cfg = cfg
+        self.fatal = False  # set when the loop breaker gives up; main() then exits non-zero
         self._supervisor_task: asyncio.Task | None = None
+        self._close_task: asyncio.Task | None = None
         self._wake = asyncio.Event()
         self._play_started = 0.0
         self._fail_streak = 0
@@ -232,6 +247,10 @@ class StreamBot(discord.Client):
         self._had_voice = False
         self._left_voice_at: float | None = None
         self._pending: discord.AudioSource | None = None  # stream opened ahead of a (re)join
+        self._joined_at: float | None = None  # when the current voice session connected (None = none, or left on purpose)
+        self._stale_since: float | None = None  # since when the voice client has been disconnected
+        self._flaps: deque[float] = deque()  # times of recent voice sessions that died young
+        self._trips: deque[float] = deque()  # times the loop breaker fired
 
     async def setup_hook(self) -> None:
         self._supervisor_task = asyncio.create_task(self._supervise(), name="stream-supervisor")
@@ -281,14 +300,29 @@ class StreamBot(discord.Client):
                 await asyncio.sleep(wait)
 
     async def _tick(self) -> None:
+        if self.fatal:
+            return  # shutting down, see _break_flap_loop
+
         channel = await self._resolve_channel()
         vc = channel.guild.voice_client
 
         if vc is not None and not vc.is_connected():
+            # The library tries to bring a dropped voice connection back by itself (it waits up to
+            # 30 s). Forcing a rejoin right away makes the two fight over one session, so give it
+            # time first and only then treat the client as stale.
+            now = time.monotonic()
+            if self._stale_since is None:
+                self._stale_since = now
+                log.warning("Voice connection lost, giving the library %ds to recover it", STALE_GRACE)
+            if now - self._stale_since < STALE_GRACE:
+                return
             log.warning("Stale voice client, discarding it")
+            self._stale_since = None
             await vc.disconnect(force=True)
             self._left_voice_at = time.monotonic()
             vc = None
+        else:
+            self._stale_since = None
 
         listeners = self._count_listeners(channel)
 
@@ -302,10 +336,15 @@ class StreamBot(discord.Client):
                     self._stop_stream(vc)
                     log.info("Leaving #%s, nobody is listening", channel.name)
                     await self._drop_voice()
+                self._joined_at = None  # left on purpose: not a flap
                 self._touch_health()  # out of the channel on purpose = healthy
                 return
 
         if vc is None:
+            self._note_session_end()
+            if self._voice_flapping():
+                await self._break_flap_loop()
+                return
             if self._pending is None and (listeners > 0 or self.cfg.idle_timeout <= 0):
                 # Open the stream now, so it connects and buffers during the rejoin pause and the
                 # voice handshake (several seconds with DAVE) instead of only after them.
@@ -320,6 +359,7 @@ class StreamBot(discord.Client):
             except BaseException:
                 self._discard_pending()
                 raise
+            self._joined_at = time.monotonic()
         elif vc.channel.id != channel.id:
             log.info("Bot was moved out of the target channel, returning")
             await vc.move_to(channel)
@@ -340,6 +380,60 @@ class StreamBot(discord.Client):
         # Healthy = connected and either playing or idle on purpose (nobody to play for).
         if vc.is_connected() and (idle or vc.is_playing()):
             self._touch_health()
+
+    # ---- reconnect loop protection ---------------------------------------
+
+    def _note_session_end(self) -> None:
+        """Called when there is no voice client: if the last session died young, count it as a flap."""
+        if self._joined_at is None:
+            return
+        now = time.monotonic()
+        lasted = now - self._joined_at
+        self._joined_at = None
+        if lasted < SHORT_SESSION:
+            self._flaps.append(now)
+            log.warning("Voice session ended after only %.0fs (short sessions lately: %d)", lasted, len(self._flaps))
+
+    def _voice_flapping(self) -> bool:
+        now = time.monotonic()
+        while self._flaps and now - self._flaps[0] > FLAP_WINDOW:
+            self._flaps.popleft()
+        return len(self._flaps) >= FLAP_LIMIT
+
+    async def _break_flap_loop(self) -> None:
+        """Voice sessions keep dying seconds after they start: stop rejoining and let things settle.
+
+        Staying out of voice for longer than the library's 30 s reconnect timeout lets its leftover
+        timers expire, which is what ends the loop (confirmed by hand on 2026-10-09: leave the
+        channel, wait, come back). If that does not help twice within ESCALATE_WINDOW, exit and let
+        the container's restart policy start a clean process.
+        """
+        now = time.monotonic()
+        count = len(self._flaps)
+        while self._trips and now - self._trips[0] > ESCALATE_WINDOW:
+            self._trips.popleft()
+        self._trips.append(now)
+        self._flaps.clear()
+        self._discard_pending()
+        await self._drop_voice()
+
+        if len(self._trips) >= ESCALATE_TRIPS:
+            log.error(
+                "Voice keeps dropping even after a pause (%d short sessions, loop breaker fired %d times in %ds); "
+                "exiting so the container is restarted",
+                count, len(self._trips), ESCALATE_WINDOW,
+            )
+            self.fatal = True
+            # close() cancels the supervisor task, which is the task running this code, so it
+            # has to run as a separate task.
+            self._close_task = asyncio.get_running_loop().create_task(self.close())
+            return
+
+        log.error(
+            "Voice dropped %d times within %ds; staying out of voice for %ds so the old reconnect timers can expire",
+            count, FLAP_WINDOW, FLAP_COOLDOWN,
+        )
+        await asyncio.sleep(FLAP_COOLDOWN)
 
     async def _rejoin_cooldown(self) -> None:
         """Wait a few seconds before rejoining voice after leaving it (on purpose or not).
@@ -522,6 +616,8 @@ def main() -> None:
 
     client = StreamBot(cfg)
     client.run(cfg.token, log_handler=None)  # logging is already configured above
+    if client.fatal:
+        sys.exit(1)  # non-zero exit: Docker's restart policy starts a clean process
 
 
 if __name__ == "__main__":
